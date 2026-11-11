@@ -712,32 +712,38 @@ std::atomic<int64_t> pcache_built_since_save{0};
 // size: data the cache took in since. The pipeline creation feedback cannot tell the new ones apart: NVIDIA's driver reports
 // most precompiled pipelines as not found in the app's cache (~460 of ~12,900 here), which it then serves from its own.
 std::atomic<size_t> pcache_saved_size{0};
+struct PipelineCacheData {
+    std::unique_ptr<uint8_t[]> bytes;
+    size_t size = 0;
+};
 /// A pipeline cache file's data, or nothing when it cannot be read or was made by another device or driver
-std::vector<uint8_t> pcache_file_read(const std::string& path) {
-    std::vector<uint8_t> data;
-    if (FILE* f = fopen(path.c_str(), "rb")) {
-        _fseeki64(f, 0, SEEK_END);
-        const int64_t sz = _ftelli64(f);
-        _fseeki64(f, 0, SEEK_SET);
-        if (sz > 32) {
-            data.resize((size_t)sz);
-            if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
-        }
-        fclose(f);
-    }
-    // (data of another device or driver is dropped before Vulkan sees it)
-    if (data.size() >= 32) {
-        uint32_t head_size, version, vendor, device;
-        std::memcpy(&head_size, data.data(), 4);
-        std::memcpy(&version, data.data() + 4, 4);
-        std::memcpy(&vendor, data.data() + 8, 4);
-        std::memcpy(&device, data.data() + 12, 4);
-        if (head_size < 32 || head_size > data.size() || version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||   // (hookshot)
-            vendor != dev.props.vendorID || device != dev.props.deviceID ||
-            std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
-            data.clear();
-    }
-    return data;
+PipelineCacheData pcache_file_read(const std::string& path) {
+    const std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "rb"), fclose);
+    FILE* f = file.get();
+    if (!f || _fseeki64(f, 0, SEEK_END) != 0) return {};
+    const int64_t sz = _ftelli64(f);
+    uint8_t header[32];
+    if (sz <= (int64_t)sizeof(header) || (uint64_t)sz > SIZE_MAX || _fseeki64(f, 0, SEEK_SET) != 0 ||
+        fread(header, 1, sizeof(header), f) != sizeof(header))
+        return {};
+
+    // A driver update can invalidate gigabytes of cache data. Check the header before allocating or reading the payload.
+    uint32_t head_size, version, vendor, device;
+    std::memcpy(&head_size, header, 4);
+    std::memcpy(&version, header + 4, 4);
+    std::memcpy(&vendor, header + 8, 4);
+    std::memcpy(&device, header + 12, 4);
+    if (head_size < sizeof(header) || head_size > sz || version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+        vendor != dev.props.vendorID || device != dev.props.deviceID ||
+        std::memcmp(header + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
+        return {};
+
+    const size_t size = (size_t)sz;
+    auto bytes = std::make_unique_for_overwrite<uint8_t[]>(size);
+    std::memcpy(bytes.get(), header, sizeof(header));
+    const size_t payload = size - sizeof(header);
+    if (fread(bytes.get() + sizeof(header), 1, payload, f) != payload) return {};
+    return {std::move(bytes), size};
 }
 std::string pcache_dir;
 
@@ -791,15 +797,15 @@ size_t play_files_merge() {
         if (num.size() > 9 || num.find_first_not_of("0123456789") != std::string::npos) continue;
         play_seq = std::max(play_seq, (uint32_t)std::stoul(num));
         const std::string path = e.path().string();
-        const std::vector<uint8_t> part = pcache_file_read(path);
+        const PipelineCacheData part = pcache_file_read(path);
         VkPipelineCache tmp = VK_NULL_HANDLE;
         VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        ci.initialDataSize = part.size(), ci.pInitialData = part.data();
-        if (part.empty() || vkCreatePipelineCache(dev.device, &ci, nullptr, &tmp) != VK_SUCCESS) {
+        ci.initialDataSize = part.size, ci.pInitialData = part.bytes.get();
+        if (!part.bytes || vkCreatePipelineCache(dev.device, &ci, nullptr, &tmp) != VK_SUCCESS) {
             remove(path.c_str());
             continue;
         }
-        if (vkMergePipelineCaches(dev.device, pcache, 1, &tmp) == VK_SUCCESS) merged.push_back(path), merged_kb += part.size() >> 10;
+        if (vkMergePipelineCaches(dev.device, pcache, 1, &tmp) == VK_SUCCESS) merged.push_back(path), merged_kb += part.size >> 10;
         vkDestroyPipelineCache(dev.device, tmp, nullptr);
     }
     if (!merged.empty()) logf("vk: pipeline cache: %zu play files merged (%zu KB)", merged.size(), merged_kb);
@@ -912,15 +918,15 @@ void pcache_init() {
     // starts empty and is not saved; the driver's own shader cache is all there is)
     static const bool off = getenv("RX_VK_PCACHE_LOAD") && atoi(getenv("RX_VK_PCACHE_LOAD")) == 0;
     pcache_no_save = off;
-    std::vector<uint8_t> data = off ? std::vector<uint8_t>{} : pcache_file_read(pcache_path);
+    PipelineCacheData data = off ? PipelineCacheData{} : pcache_file_read(pcache_path);
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    ci.initialDataSize = data.size();
-    ci.pInitialData = data.empty() ? nullptr : data.data();
+    ci.initialDataSize = data.size;
+    ci.pInitialData = data.bytes.get();
     if (vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache) != VK_SUCCESS) {
         ci.initialDataSize = 0, ci.pInitialData = nullptr;
         vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache);
     }
-    logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
+    logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size >> 10);
     data = {};
     if (pcache) play_files_merge();
     // (what it holds as read, the play files too: a save of data that size has nothing to add to the files)

@@ -23,7 +23,7 @@ import tempfile
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ["route", "save", "retry", "users", "merge", "compact", "compact-failed", "off", "no-control"]
+CASES = ["read", "route", "save", "retry", "users", "merge", "compact", "compact-failed", "off", "no-control"]
 
 
 def play_block(source):
@@ -42,7 +42,10 @@ def main():
     failed = []
     with tempfile.TemporaryDirectory(prefix="hookshot-play-cache-") as temp:
         temp = Path(temp)
-        (temp / "pipeline_play_cache.inc").write_text(play_block(a.source.read_text(encoding="utf-8")), encoding="utf-8")
+        source = a.source.read_text(encoding="utf-8")
+        reader = source[source.index("struct PipelineCacheData {"):source.index("std::string pcache_dir;")]
+        (temp / "pipeline_cache_read.inc").write_text(reader, encoding="utf-8")
+        (temp / "pipeline_play_cache.inc").write_text(play_block(source), encoding="utf-8")
         exe = temp / "check.exe"
         cmd = [a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-pthread", "-I" + str(temp),
                str(ROOT / "tests/pipeline_play_cache_test.cpp"), "-o", str(exe)]

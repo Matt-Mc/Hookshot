@@ -1,5 +1,5 @@
 // The play caches of gpu/vk/vk_draw.cpp (struct PlayCache to the end of create_cached) extracted unmodified, on a model of
-// Vulkan pipeline caches: a cache is a set of pipeline keys, its data "FAKE" and the keys. The driver keeps a disk cache of its own,
+// Vulkan pipeline caches: a cache is a set of pipeline keys, stored after a Vulkan cache header. The driver keeps a disk cache of its own,
 // and, as NVIDIA's does, copies a pipeline it takes from there into the cache the pipeline is asked of. No driver is loaded.
 #include <algorithm>
 #include <atomic>
@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -26,6 +27,8 @@ void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(
 using VkResult = int;
 constexpr VkResult VK_SUCCESS = 0, VK_ERROR_UNKNOWN = -13, VK_PIPELINE_COMPILE_REQUIRED = 1000297000;
 constexpr unsigned VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT = 0x100;
+constexpr uint32_t VK_PIPELINE_CACHE_HEADER_VERSION_ONE = 1;
+constexpr size_t VK_UUID_SIZE = 16;
 enum { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17 };
 struct FakeCache {
     std::mutex mu;
@@ -45,6 +48,10 @@ struct VkPipelineCacheCreateInfo {
 struct {
     int device = 1;
     struct { bool pipelineCreationCacheControl = true; } vk13;
+    struct {
+        uint32_t vendorID = 0x1234, deviceID = 0x5678;
+        uint8_t pipelineCacheUUID[VK_UUID_SIZE]{1, 2, 3};
+    } props;
 } dev;
 VkPipelineCache pcache = nullptr;
 std::string pcache_dir, pcache_path;
@@ -63,24 +70,36 @@ void logf(const char* fmt, ...) {
 }
 std::set<uint64_t> parse(const uint8_t* p, size_t n) {
     std::set<uint64_t> keys;
-    for (size_t at = 4; at + 8 <= n; at += 8) {
+    for (size_t at = 32; at + 8 <= n; at += 8) {
         uint64_t k;
         std::memcpy(&k, p + at, 8);
         keys.insert(k);
     }
     return keys;
 }
-/// (vk_draw.cpp's own checks the header: here a file not starting "FAKE" is another driver's)
-std::vector<uint8_t> pcache_file_read(const std::string& path) {
-    std::vector<uint8_t> data;
-    if (FILE* f = std::fopen(path.c_str(), "rb")) {
-        uint8_t buf[4096];
-        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
-        std::fclose(f);
-    }
-    if (data.size() < 4 || std::memcmp(data.data(), "FAKE", 4)) data.clear();
-    return data;
+void cache_header(uint8_t* p, bool matching) {
+    const uint32_t words[] = {32, VK_PIPELINE_CACHE_HEADER_VERSION_ONE, dev.props.vendorID, dev.props.deviceID};
+    std::memcpy(p, words, sizeof(words));
+    std::memcpy(p + sizeof(words), dev.props.pipelineCacheUUID, VK_UUID_SIZE);
+    if (!matching) p[16] ^= 1;
 }
+
+size_t bytes_read = 0;
+bool short_payload = false;
+size_t track_read(void* dst, size_t size, size_t count, FILE* f) {
+    if (short_payload && bytes_read == 32) --count;
+    const size_t read = std::fread(dst, size, count, f);
+    bytes_read += read * size;
+    return read;
+}
+#ifndef _WIN32
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#endif
+#define fread track_read
+#include "pipeline_cache_read.inc"
+#undef fread
+
 VkResult vkCreatePipelineCache(int, const VkPipelineCacheCreateInfo* ci, const void*, VkPipelineCache* out) {
     auto* c = new FakeCache;
     if (ci->initialDataSize) c->keys = parse((const uint8_t*)ci->pInitialData, ci->initialDataSize);
@@ -94,12 +113,12 @@ void vkDestroyPipelineCache(int, VkPipelineCache c, const void*) {
 }
 VkResult vkGetPipelineCacheData(int, VkPipelineCache c, size_t* n, void* data) {
     std::lock_guard lk(c->mu);
-    const size_t size = 4 + 8 * c->keys.size();
+    const size_t size = 32 + 8 * c->keys.size();
     if (!data) return *n = size, VK_SUCCESS;
     if (*n < size) return VK_ERROR_UNKNOWN;
     auto* p = (uint8_t*)data;
-    std::memcpy(p, "FAKE", 4);
-    size_t at = 4;
+    cache_header(p, true);
+    size_t at = 32;
     for (uint64_t k : c->keys) std::memcpy(p + at, &k, 8), at += 8;
     *n = size;
     return VK_SUCCESS;
@@ -197,12 +216,14 @@ bool exists(const std::string& path) {
     return std::filesystem::exists(path);
 }
 std::set<uint64_t> file_keys(const std::string& path) {
-    const std::vector<uint8_t> data = pcache_file_read(path);
-    return data.empty() ? std::set<uint64_t>{} : parse(data.data(), data.size());
+    const PipelineCacheData data = pcache_file_read(path);
+    return parse(data.bytes.get(), data.size);
 }
 void write_file(const std::string& path, const std::string& head, std::set<uint64_t> keys) {
     FILE* f = std::fopen(path.c_str(), "wb");
-    std::fwrite(head.data(), 1, head.size(), f);
+    uint8_t header[32];
+    cache_header(header, head == "FAKE");
+    std::fwrite(header, 1, sizeof(header), f);
     for (uint64_t k : keys) std::fwrite(&k, 8, 1, f);
     std::fclose(f);
 }
@@ -218,7 +239,17 @@ VkPipelineCache cache_of(std::set<uint64_t> keys) {
 }
 
 int run(const std::string& name) {
-    if (name == "route") {
+    if (name == "read") {
+        CHECK(!pcache_file_read(pcache_path).bytes && bytes_read == 0);
+        write_file(pcache_path, "OTHR", {1, 2});
+        CHECK(!pcache_file_read(pcache_path).bytes && bytes_read == 32);
+        write_file(pcache_path, "FAKE", {1, 2});
+        bytes_read = 0;
+        CHECK(file_keys(pcache_path) == (std::set<uint64_t>{1, 2}) && bytes_read == 48);
+        bytes_read = 0;
+        short_payload = true;
+        CHECK(!pcache_file_read(pcache_path).bytes && bytes_read == 47);
+    } else if (name == "route") {
         pcache = cache_of({1});   // (1: the start's cache alone has it)
         driver = {2};             // (2: the driver's own cache alone)
         CHECK(make(3) == VK_SUCCESS && has(pcache, 3) && compiles == 1);   // (before play: into the start's cache)
